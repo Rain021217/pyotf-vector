@@ -25,7 +25,7 @@ from dphtools.utils import bin_ndarray, radial_profile, slice_maker
 from scipy.signal import fftconvolve
 
 from .display import otf_plot, psf_plot
-from .otf import HanserPSF, SheppardPSF
+from .otf import HanserPSF, SheppardPSF, apply_aberration
 from .utils import NumericProperty, easy_fft, easy_ifft
 
 logger = logging.getLogger(__name__)
@@ -194,13 +194,30 @@ class ConfocalMicroscope(WidefieldMicroscope):
 
     wl_exc = NumericProperty(attr="_wl_exc", vartype=float, doc="The excitation wavelength")
 
-    def __init__(self, *, wl_exc, pinhole_size, **kwargs):
+    def __init__(
+        self,
+        *,
+        wl_exc,
+        pinhole_size,
+        pcoefs_em=None,
+        mcoefs_em=None,
+        pcoefs_exc=None,
+        mcoefs_exc=None,
+        excitation_vec_corr="total",
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.pinhole_size = pinhole_size
 
-        # make the emission PSF
+        if pcoefs_em is not None or mcoefs_em is not None:
+            self.model = apply_aberration(self.model, mcoefs_em, pcoefs_em)
+
+        # make the excitation PSF
         self.model_exc = copy.deepcopy(self.model)
         self.model_exc.wl = wl_exc
+        self.model_exc.vec_corr = excitation_vec_corr
+        if pcoefs_exc is not None or mcoefs_exc is not None:
+            self.model_exc = apply_aberration(self.model_exc, mcoefs_exc, pcoefs_exc)
 
     def __repr__(self):
         """Represent a confocal microscope."""
@@ -208,6 +225,12 @@ class ConfocalMicroscope(WidefieldMicroscope):
             super().__repr__()[:-1]
             + f", wl_exc={self.model_exc.wl}, pinhole_size={self.pinhole_size})"
         )
+
+
+    @property
+    def excitation_psf(self):
+        """Vector-aware excitation intensity PSF on the internal simulation grid."""
+        return self.model_exc.PSFi
 
     @property
     def model_psf(self):
@@ -225,6 +248,54 @@ class ConfocalMicroscope(WidefieldMicroscope):
             psf_det_au = self.model.PSFi
         psf_con_au = psf_det_au * self.model_exc.PSFi
         return psf_con_au
+
+
+class FourPiConfocalMicroscope(ConfocalMicroscope):
+    """Simple 4Pi-confocal model based on counter-propagating objective pairs.
+
+    This class extends :class:`ConfocalMicroscope` with coherent interference between
+    mirrored pupil fields, and applies pinhole filtering in detection.
+    """
+
+    def __init__(
+        self,
+        *,
+        phase_exc=0.0,
+        phase_det=0.0,
+        interfere_excitation=True,
+        interfere_detection=True,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.phase_exc = phase_exc
+        self.phase_det = phase_det
+        self.interfere_excitation = interfere_excitation
+        self.interfere_detection = interfere_detection
+
+    @staticmethod
+    def _intensity_from_interference(model, phase, interfere=True):
+        field_forward = model.PSFa
+        field_backward = np.flip(model.PSFa, axis=1) * np.exp(1j * phase)
+        if interfere:
+            return (np.abs(field_forward + field_backward) ** 2).sum(axis=0)
+        return (np.abs(field_forward) ** 2).sum(axis=0) + (np.abs(field_backward) ** 2).sum(axis=0)
+
+    @property
+    def model_psf(self):
+        airy_unit = 1.22 * self.model.wl / self.model.na / self.model.res
+        pixel_pinhole_radius = self.pinhole_size * airy_unit / 2
+
+        det_psf = self._intensity_from_interference(
+            self.model, self.phase_det, self.interfere_detection
+        )
+        if pixel_pinhole_radius > 1.5:
+            kernel = _disk_kernel(pixel_pinhole_radius)
+            det_psf = fftconvolve(det_psf, kernel[None], "same", axes=(1, 2))
+
+        exc_psf = self._intensity_from_interference(
+            self.model_exc, self.phase_exc, self.interfere_excitation
+        )
+        return det_psf * exc_psf
 
 
 class ApotomeMicroscope(WidefieldMicroscope):
