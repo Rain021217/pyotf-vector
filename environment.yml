@@ -1,0 +1,14 @@
+name: pyotf
+channels:
+  - defaults
+  - anaconda
+  - conda-forge
+  - david-hoffman
+dependencies:
+  - python>=3.8
+  - numpy
+  - scipy
+  - scikit-image
+  - matplotlib
+  - tifffile
+  - dphtools
