@@ -29,6 +29,8 @@ def test_confocal_small_pinhole_reduces_out_of_focus_signal():
     center_small = psf_small[z_center].sum()
     off_axis_open = psf_open[z_center + 2].sum()
     off_axis_small = psf_small[z_center + 2].sum()
+
+    # Smaller pinhole should improve optical sectioning (higher on/off contrast).
     assert off_axis_small / center_small < off_axis_open / center_open
 
 

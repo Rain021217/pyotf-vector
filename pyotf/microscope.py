@@ -244,6 +244,12 @@ class ConfocalMicroscope(WidefieldMicroscope):
             + f", wl_exc={self.model_exc.wl}, pinhole_size={self.pinhole_size}, pinhole_mode='{self.pinhole_mode}')"
         )
 
+
+    @property
+    def excitation_psf(self):
+        """Vector-aware excitation intensity PSF on the internal simulation grid."""
+        return self.model_exc.PSFi
+
     @property
     def excitation_psf(self):
         """Vector-aware excitation intensity PSF on the internal simulation grid."""
@@ -414,6 +420,54 @@ class FourPiConfocalMicroscope(ConfocalMicroscope):
     @property
     def model_psf(self):
         return self.detection_psf * self.excitation_psf
+
+
+class FourPiConfocalMicroscope(ConfocalMicroscope):
+    """Simple 4Pi-confocal model based on counter-propagating objective pairs.
+
+    This class extends :class:`ConfocalMicroscope` with coherent interference between
+    mirrored pupil fields, and applies pinhole filtering in detection.
+    """
+
+    def __init__(
+        self,
+        *,
+        phase_exc=0.0,
+        phase_det=0.0,
+        interfere_excitation=True,
+        interfere_detection=True,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.phase_exc = phase_exc
+        self.phase_det = phase_det
+        self.interfere_excitation = interfere_excitation
+        self.interfere_detection = interfere_detection
+
+    @staticmethod
+    def _intensity_from_interference(model, phase, interfere=True):
+        field_forward = model.PSFa
+        field_backward = np.flip(model.PSFa, axis=1) * np.exp(1j * phase)
+        if interfere:
+            return (np.abs(field_forward + field_backward) ** 2).sum(axis=0)
+        return (np.abs(field_forward) ** 2).sum(axis=0) + (np.abs(field_backward) ** 2).sum(axis=0)
+
+    @property
+    def model_psf(self):
+        airy_unit = 1.22 * self.model.wl / self.model.na / self.model.res
+        pixel_pinhole_radius = self.pinhole_size * airy_unit / 2
+
+        det_psf = self._intensity_from_interference(
+            self.model, self.phase_det, self.interfere_detection
+        )
+        if pixel_pinhole_radius > 1.5:
+            kernel = _disk_kernel(pixel_pinhole_radius)
+            det_psf = fftconvolve(det_psf, kernel[None], "same", axes=(1, 2))
+
+        exc_psf = self._intensity_from_interference(
+            self.model_exc, self.phase_exc, self.interfere_excitation
+        )
+        return det_psf * exc_psf
 
 
 class ApotomeMicroscope(WidefieldMicroscope):
