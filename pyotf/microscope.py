@@ -301,6 +301,70 @@ class ConfocalMicroscope(WidefieldMicroscope):
             + f", wl_exc={self.model_exc.wl}, pinhole_size={self.pinhole_size}, pinhole_mode='{self.pinhole_mode}')"
         )
 
+
+    @property
+    def excitation_psf(self):
+        """Vector-aware excitation intensity PSF on the internal simulation grid."""
+        return self.model_exc.PSFi
+
+    @property
+    def excitation_psf(self):
+        """Vector-aware excitation intensity PSF on the internal simulation grid."""
+        return self.model_exc.PSFi
+
+    @property
+    def detection_psf(self):
+        """Detection intensity PSF after pinhole transmission."""
+        return self._pinhole_filter_psf(self.model.PSFi)
+
+    def _pinhole_radius_px(self):
+        airy_unit = 1.22 * self.model.wl / self.model.na / self.model.res
+        logger.debug(f"Airy unit = {airy_unit:}")
+        return self.pinhole_size * airy_unit / 2
+
+    def _pinhole_filter_psf(self, det_psf):
+        pixel_pinhole_radius = self._pinhole_radius_px()
+        if pixel_pinhole_radius <= 1.5:
+            return det_psf
+
+        kernel = _disk_kernel(float(pixel_pinhole_radius))
+        if self.pinhole_mode == "object":
+            return fftconvolve(det_psf, kernel[None], "same", axes=(1, 2))
+        if self.pinhole_mode == "detector":
+            # Perform a linear (not circular) convolution in the detector plane by
+            # zero-padding both the PSF and the pinhole kernel to the full
+            # convolution size, multiplying in the OTF domain, and then cropping
+            # back to the original PSF size (equivalent to mode="same").
+            nz, ny, nx = det_psf.shape
+            ky, kx = kernel.shape
+            out_y = ny + ky - 1
+            out_x = nx + kx - 1
+
+            # Pad and center the pinhole kernel in the larger array.
+            kernel_pad = np.zeros((out_y, out_x), dtype=float)
+            y0_k = (out_y - ky) // 2
+            x0_k = (out_x - kx) // 2
+            kernel_pad[y0_k : y0_k + ky, x0_k : x0_k + kx] = kernel
+
+            # Pad and center the detection PSF slices in the larger array.
+            psf_pad = np.zeros((nz, out_y, out_x), dtype=det_psf.dtype)
+            y0_p = (out_y - ny) // 2
+            x0_p = (out_x - nx) // 2
+            psf_pad[:, y0_p : y0_p + ny, x0_p : x0_p + nx] = det_psf
+
+            # FFT-based linear convolution: multiply OTFs and transform back.
+            pinhole_otf = easy_fft(kernel_pad, axes=(0, 1))
+            det_otf = easy_fft(psf_pad, axes=(1, 2))
+            filtered = easy_ifft(det_otf * pinhole_otf[None], axes=(1, 2)).real
+
+            # Crop back to the original PSF size (mode="same").
+            start_y = (out_y - ny) // 2
+            start_x = (out_x - nx) // 2
+            end_y = start_y + ny
+            end_x = start_x + nx
+            return filtered[:, start_y:end_y, start_x:end_x]
+        raise ValueError("`pinhole_mode` must be one of {'object', 'detector'}")
+
     @property
     def excitation_psf(self):
         """Vector-aware excitation intensity PSF on the internal simulation grid."""
