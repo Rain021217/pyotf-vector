@@ -11,8 +11,14 @@ def zernike_phase_map(rho, phi, pcoefs=None):
     """Return phase aberration map from Noll-ordered Zernike coefficients."""
     if pcoefs is None:
         return np.zeros_like(rho)
-    pcoefs = np.asarray(pcoefs)
-    zerns = zernike(rho, phi, *noll2degrees(np.arange(len(pcoefs)) + 1))
+    if np.isscalar(pcoefs):
+        raise TypeError("`pcoefs` must be a 1D sequence, not a scalar")
+    pcoefs = np.atleast_1d(np.asarray(pcoefs))
+    if pcoefs.ndim != 1:
+        raise TypeError("`pcoefs` must be a 1D sequence")
+    if pcoefs.size == 0:
+        return np.zeros_like(rho)
+    zerns = zernike(rho, phi, *noll2degrees(np.arange(pcoefs.size) + 1))
     return (zerns * pcoefs[:, None, None]).sum(0)
 
 
@@ -35,6 +41,17 @@ def richards_wolf_linearly_polarized_psf(
     This implementation is intentionally explicit and slower than FFT-based pupil methods,
     and is intended for validation / benchmark use.
     """
+    if wl <= 0:
+        raise ValueError("`wl` must be positive")
+    if ni <= 0:
+        raise ValueError("`ni` must be positive")
+    if na <= 0 or na > ni:
+        raise ValueError("`na` must satisfy 0 < na <= ni")
+    if n_theta < 2:
+        raise ValueError("`n_theta` must be >= 2")
+    if n_phi < 1:
+        raise ValueError("`n_phi` must be >= 1")
+
     x = np.asarray(x)
     y = np.asarray(y)
     z = np.asarray(z)
@@ -45,7 +62,7 @@ def richards_wolf_linearly_polarized_psf(
 
     theta = np.linspace(0, alpha, n_theta)
     phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
-    dtheta = theta[1] - theta[0] if n_theta > 1 else alpha
+    dtheta = theta[1] - theta[0]
     dphi = phi[1] - phi[0] if n_phi > 1 else 2 * np.pi
 
     th, ph = np.meshgrid(theta, phi, indexing="ij")
@@ -83,7 +100,12 @@ def richards_wolf_linearly_polarized_psf(
         ey = wy.sum(axis=(0, 1))
         ez = wz.sum(axis=(0, 1))
         out[iz] = (np.abs(ex) ** 2 + np.abs(ey) ** 2 + np.abs(ez) ** 2).real
-    return out / out.sum()
+    total = out.sum()
+    if total <= 0 or not np.isfinite(total):
+        raise ValueError(
+            "Computed PSF normalization is invalid; check input parameters"
+        )
+    return out / total
 
 
 def axial_profile(psf):
@@ -95,4 +117,9 @@ def optical_sectioning_ratio(psf, dz=2):
     """Compute off-focus to in-focus ratio using integrated z planes."""
     profile = axial_profile(psf)
     z0 = len(profile) // 2
-    return profile[z0 + dz] / profile[z0]
+    zidx = z0 + dz
+    if not (0 <= zidx < len(profile)):
+        lo = -z0
+        hi = len(profile) - 1 - z0
+        raise ValueError(f"`dz` is out of range. valid range is [{lo}, {hi}]")
+    return profile[zidx] / profile[z0]

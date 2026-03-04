@@ -123,3 +123,19 @@ def test_fourpi_phase_scan_invalid_channel_raises():
     model = FourPiConfocalMicroscope(wl_exc=488, pinhole_size=0.8, **BASE_KWARGS)
     with pytest.raises(ValueError):
         model.phase_scan(np.linspace(0, np.pi, 3), channel="invalid")
+
+
+def test_confocal_sheppard_aberration_coerces_and_runs():
+    model = ConfocalMicroscope(
+        model="sheppard",
+        na=1.1,
+        ni=1.33,
+        wl=520,
+        size=32,
+        pixel_size=80,
+        oversample_factor=1,
+        wl_exc=488,
+        pinhole_size=1.0,
+        aberrations_em={"defocus": 0.15},
+    )
+    assert model.PSF.shape[0] == 32

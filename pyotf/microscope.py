@@ -191,15 +191,42 @@ def _disk_kernel(radius):
     return kernel / kernel.sum()
 
 
+def _coerce_to_hanser_for_aberration(model):
+    """Coerce supported models to HanserPSF so aberration APIs are usable."""
+    if isinstance(model, HanserPSF):
+        return model
+    if isinstance(model, SheppardPSF):
+        logger.info(
+            "Aberrations for SheppardPSF are applied via an equivalent HanserPSF proxy"
+        )
+        return HanserPSF(
+            wl=model.wl,
+            na=model.na,
+            ni=model.ni,
+            res=model.res,
+            size=model.size,
+            zres=model.zres,
+            zsize=model.zsize,
+            vec_corr=model.vec_corr,
+            condition=model.condition,
+        )
+    raise ValueError(
+        "Aberration application is only supported for HanserPSF/SheppardPSF-backed microscopes"
+    )
+
+
 def _apply_aberration_spec(model, *, mcoefs=None, pcoefs=None, aberrations=None):
     """Apply one of the supported aberration specifications to a PSF model."""
+    has_spec = aberrations is not None or mcoefs is not None or pcoefs is not None
+    if not has_spec:
+        return model
+
+    model = _coerce_to_hanser_for_aberration(model)
     if aberrations is not None:
         if not isinstance(aberrations, dict):
             raise TypeError("`aberrations` must be a dict of named aberrations")
         return apply_named_aberrations(model, aberrations)
-    if mcoefs is not None or pcoefs is not None:
-        return apply_aberration(model, mcoefs, pcoefs)
-    return model
+    return apply_aberration(model, mcoefs, pcoefs)
 
 
 def _validate_pinhole_mode(mode):
