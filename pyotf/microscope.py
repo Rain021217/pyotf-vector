@@ -18,14 +18,14 @@ Copyright (c) 2020, David Hoffman
 
 import copy
 import logging
-from functools import cached_property
+from functools import cached_property, lru_cache
 
 import numpy as np
 from dphtools.utils import bin_ndarray, radial_profile, slice_maker
 from scipy.signal import fftconvolve
 
 from .display import otf_plot, psf_plot
-from .otf import HanserPSF, SheppardPSF, apply_aberration
+from .otf import HanserPSF, SheppardPSF, apply_aberration, apply_named_aberrations
 from .utils import NumericProperty, easy_fft, easy_ifft
 
 logger = logging.getLogger(__name__)
@@ -172,6 +172,7 @@ class WidefieldMicroscope(object):
         return fig, axs
 
 
+@lru_cache(maxsize=128)
 def _disk_kernel(radius):
     """Model of the pinhole transmission function."""
     full_size = int(np.ceil(radius * 2))
@@ -181,6 +182,17 @@ def _disk_kernel(radius):
     r = np.sqrt((coords**2).sum(0))
     kernel = r < radius
     return kernel / kernel.sum()
+
+
+def _apply_aberration_spec(model, *, mcoefs=None, pcoefs=None, aberrations=None):
+    """Apply one of the supported aberration specifications to a PSF model."""
+    if aberrations is not None:
+        if not isinstance(aberrations, dict):
+            raise TypeError("`aberrations` must be a dict of named aberrations")
+        return apply_named_aberrations(model, aberrations)
+    if mcoefs is not None or pcoefs is not None:
+        return apply_aberration(model, mcoefs, pcoefs)
+    return model
 
 
 class ConfocalMicroscope(WidefieldMicroscope):
@@ -203,27 +215,33 @@ class ConfocalMicroscope(WidefieldMicroscope):
         mcoefs_em=None,
         pcoefs_exc=None,
         mcoefs_exc=None,
+        aberrations_em=None,
+        aberrations_exc=None,
         excitation_vec_corr="total",
+        pinhole_mode="object",
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.pinhole_size = pinhole_size
+        self.pinhole_mode = pinhole_mode
 
-        if pcoefs_em is not None or mcoefs_em is not None:
-            self.model = apply_aberration(self.model, mcoefs_em, pcoefs_em)
+        self.model = _apply_aberration_spec(
+            self.model, mcoefs=mcoefs_em, pcoefs=pcoefs_em, aberrations=aberrations_em
+        )
 
         # make the excitation PSF
         self.model_exc = copy.deepcopy(self.model)
         self.model_exc.wl = wl_exc
         self.model_exc.vec_corr = excitation_vec_corr
-        if pcoefs_exc is not None or mcoefs_exc is not None:
-            self.model_exc = apply_aberration(self.model_exc, mcoefs_exc, pcoefs_exc)
+        self.model_exc = _apply_aberration_spec(
+            self.model_exc, mcoefs=mcoefs_exc, pcoefs=pcoefs_exc, aberrations=aberrations_exc
+        )
 
     def __repr__(self):
         """Represent a confocal microscope."""
         return (
             super().__repr__()[:-1]
-            + f", wl_exc={self.model_exc.wl}, pinhole_size={self.pinhole_size})"
+            + f", wl_exc={self.model_exc.wl}, pinhole_size={self.pinhole_size}, pinhole_mode='{self.pinhole_mode}')"
         )
 
 
@@ -233,21 +251,175 @@ class ConfocalMicroscope(WidefieldMicroscope):
         return self.model_exc.PSFi
 
     @property
-    def model_psf(self):
-        """Oversampled confocal PSF."""
-        # Calculate the AU in pixels
+    def excitation_psf(self):
+        """Vector-aware excitation intensity PSF on the internal simulation grid."""
+        return self.model_exc.PSFi
+
+    @property
+    def detection_psf(self):
+        """Detection intensity PSF after pinhole transmission."""
+        return self._pinhole_filter_psf(self.model.PSFi)
+
+    def _pinhole_radius_px(self):
         airy_unit = 1.22 * self.model.wl / self.model.na / self.model.res
         logger.debug(f"Airy unit = {airy_unit:}")
-        # Calculate the pinhole radius in pixels
-        pixel_pinhole_radius = self.pinhole_size * airy_unit / 2
-        #
-        if pixel_pinhole_radius > 1.5:
-            kernel = _disk_kernel(pixel_pinhole_radius)
-            psf_det_au = fftconvolve(self.model.PSFi, kernel[None], "same", axes=(1, 2))
-        else:
-            psf_det_au = self.model.PSFi
-        psf_con_au = psf_det_au * self.model_exc.PSFi
-        return psf_con_au
+        return self.pinhole_size * airy_unit / 2
+
+    def _pinhole_filter_psf(self, det_psf):
+        pixel_pinhole_radius = self._pinhole_radius_px()
+        if pixel_pinhole_radius <= 1.5:
+            return det_psf
+
+        kernel = _disk_kernel(float(pixel_pinhole_radius))
+        if self.pinhole_mode == "object":
+            return fftconvolve(det_psf, kernel[None], "same", axes=(1, 2))
+        if self.pinhole_mode == "detector":
+            # Perform a linear (not circular) convolution in the detector plane by
+            # zero-padding both the PSF and the pinhole kernel to the full
+            # convolution size, multiplying in the OTF domain, and then cropping
+            # back to the original PSF size (equivalent to mode="same").
+            nz, ny, nx = det_psf.shape
+            ky, kx = kernel.shape
+            out_y = ny + ky - 1
+            out_x = nx + kx - 1
+
+            # Pad and center the pinhole kernel in the larger array.
+            kernel_pad = np.zeros((out_y, out_x), dtype=float)
+            y0_k = (out_y - ky) // 2
+            x0_k = (out_x - kx) // 2
+            kernel_pad[y0_k : y0_k + ky, x0_k : x0_k + kx] = kernel
+
+            # Pad and center the detection PSF slices in the larger array.
+            psf_pad = np.zeros((nz, out_y, out_x), dtype=det_psf.dtype)
+            y0_p = (out_y - ny) // 2
+            x0_p = (out_x - nx) // 2
+            psf_pad[:, y0_p : y0_p + ny, x0_p : x0_p + nx] = det_psf
+
+            # FFT-based linear convolution: multiply OTFs and transform back.
+            pinhole_otf = easy_fft(kernel_pad, axes=(0, 1))
+            det_otf = easy_fft(psf_pad, axes=(1, 2))
+            filtered = easy_ifft(det_otf * pinhole_otf[None], axes=(1, 2)).real
+
+            # Crop back to the original PSF size (mode="same").
+            start_y = (out_y - ny) // 2
+            start_x = (out_x - nx) // 2
+            end_y = start_y + ny
+            end_x = start_x + nx
+            return filtered[:, start_y:end_y, start_x:end_x]
+        raise ValueError("`pinhole_mode` must be one of {'object', 'detector'}")
+
+    @property
+    def model_psf(self):
+        """Oversampled confocal PSF."""
+        psf_det_au = self.detection_psf
+        return psf_det_au * self.excitation_psf
+
+
+class FourPiConfocalMicroscope(ConfocalMicroscope):
+    """4Pi-confocal model with arm-specific phase/amplitude/aberration controls."""
+
+    def __init__(
+        self,
+        *,
+        phase_exc=0.0,
+        phase_det=0.0,
+        interfere_excitation=True,
+        interfere_detection=True,
+        amp_ratio_exc=1.0,
+        amp_ratio_det=1.0,
+        aberrations_exc_arm1=None,
+        aberrations_exc_arm2=None,
+        aberrations_det_arm1=None,
+        aberrations_det_arm2=None,
+        pcoefs_exc_arm1=None,
+        mcoefs_exc_arm1=None,
+        pcoefs_exc_arm2=None,
+        mcoefs_exc_arm2=None,
+        pcoefs_det_arm1=None,
+        mcoefs_det_arm1=None,
+        pcoefs_det_arm2=None,
+        mcoefs_det_arm2=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.phase_exc = phase_exc
+        self.phase_det = phase_det
+        self.interfere_excitation = interfere_excitation
+        self.interfere_detection = interfere_detection
+        self.amp_ratio_exc = float(amp_ratio_exc)
+        self.amp_ratio_det = float(amp_ratio_det)
+
+        self.model_det_arm1 = _apply_aberration_spec(
+            copy.deepcopy(self.model),
+            mcoefs=mcoefs_det_arm1,
+            pcoefs=pcoefs_det_arm1,
+            aberrations=aberrations_det_arm1,
+        )
+        self.model_det_arm2 = _apply_aberration_spec(
+            copy.deepcopy(self.model),
+            mcoefs=mcoefs_det_arm2,
+            pcoefs=pcoefs_det_arm2,
+            aberrations=aberrations_det_arm2,
+        )
+
+        self.model_exc_arm1 = _apply_aberration_spec(
+            copy.deepcopy(self.model_exc),
+            mcoefs=mcoefs_exc_arm1,
+            pcoefs=pcoefs_exc_arm1,
+            aberrations=aberrations_exc_arm1,
+        )
+        self.model_exc_arm2 = _apply_aberration_spec(
+            copy.deepcopy(self.model_exc),
+            mcoefs=mcoefs_exc_arm2,
+            pcoefs=pcoefs_exc_arm2,
+            aberrations=aberrations_exc_arm2,
+        )
+
+    @staticmethod
+    def _intensity_from_arms(model_arm1, model_arm2, phase, amp_ratio, interfere=True):
+        field_arm1 = model_arm1.PSFa
+        field_arm2 = np.flip(model_arm2.PSFa, axis=1) * np.exp(1j * phase)
+        field_arm2 = np.sqrt(amp_ratio) * field_arm2
+        if interfere:
+            return (np.abs(field_arm1 + field_arm2) ** 2).sum(axis=0)
+        return (np.abs(field_arm1) ** 2).sum(axis=0) + (np.abs(field_arm2) ** 2).sum(axis=0)
+
+    @property
+    def excitation_psf(self):
+        return self._intensity_from_arms(
+            self.model_exc_arm1,
+            self.model_exc_arm2,
+            self.phase_exc,
+            self.amp_ratio_exc,
+            self.interfere_excitation,
+        )
+
+    @property
+    def detection_psf(self):
+        det_psf = self._intensity_from_arms(
+            self.model_det_arm1,
+            self.model_det_arm2,
+            self.phase_det,
+            self.amp_ratio_det,
+            self.interfere_detection,
+        )
+        return self._pinhole_filter_psf(det_psf)
+
+    def phase_scan(self, phases, channel="both"):
+        """Generate phase-scan stacks for 4Pi modes (e.g. I5M/I5S style post-processing)."""
+        phases = np.asarray(phases, dtype=float)
+        out = []
+        for phase in phases:
+            if channel in {"both", "excitation"}:
+                self.phase_exc = phase
+            if channel in {"both", "detection"}:
+                self.phase_det = phase
+            out.append(self.model_psf)
+        return np.asarray(out)
+
+    @property
+    def model_psf(self):
+        return self.detection_psf * self.excitation_psf
 
 
 class FourPiConfocalMicroscope(ConfocalMicroscope):
