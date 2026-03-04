@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import numpy as np
+import pytest
 
 from pyotf.microscope import ConfocalMicroscope, FourPiConfocalMicroscope
 
@@ -29,8 +30,6 @@ def test_confocal_small_pinhole_reduces_out_of_focus_signal():
     center_small = psf_small[z_center].sum()
     off_axis_open = psf_open[z_center + 2].sum()
     off_axis_small = psf_small[z_center + 2].sum()
-
-    # Smaller pinhole should improve optical sectioning (higher on/off contrast).
     assert off_axis_small / center_small < off_axis_open / center_open
 
 
@@ -51,8 +50,12 @@ def test_confocal_supports_named_aberration_api():
 
 
 def test_confocal_detector_and_object_modes_match_normalization():
-    confocal_obj = ConfocalMicroscope(wl_exc=488, pinhole_size=1.2, pinhole_mode="object", **BASE_KWARGS)
-    confocal_det = ConfocalMicroscope(wl_exc=488, pinhole_size=1.2, pinhole_mode="detector", **BASE_KWARGS)
+    confocal_obj = ConfocalMicroscope(
+        wl_exc=488, pinhole_size=1.2, pinhole_mode="object", **BASE_KWARGS
+    )
+    confocal_det = ConfocalMicroscope(
+        wl_exc=488, pinhole_size=1.2, pinhole_mode="detector", **BASE_KWARGS
+    )
     np.testing.assert_allclose(confocal_obj.PSF.sum(), 1.0)
     np.testing.assert_allclose(confocal_det.PSF.sum(), 1.0)
 
@@ -91,3 +94,48 @@ def test_fourpi_arm_specific_aberrations_and_amplitude_ratio_work():
         **BASE_KWARGS,
     )
     np.testing.assert_allclose(model.PSF.sum(), 1.0)
+
+
+def test_confocal_invalid_pinhole_mode_raises():
+    with pytest.raises(ValueError):
+        ConfocalMicroscope(
+            wl_exc=488, pinhole_size=1.0, pinhole_mode="bad", **BASE_KWARGS
+        )
+
+
+def test_fourpi_invalid_amplitude_ratio_raises():
+    with pytest.raises(ValueError):
+        FourPiConfocalMicroscope(
+            wl_exc=488, pinhole_size=0.8, amp_ratio_exc=0.0, **BASE_KWARGS
+        )
+
+
+def test_fourpi_phase_scan_restores_original_state():
+    model = FourPiConfocalMicroscope(wl_exc=488, pinhole_size=0.8, **BASE_KWARGS)
+    model.phase_exc = 0.31
+    model.phase_det = 0.77
+    _ = model.phase_scan(np.linspace(0, np.pi, 3), channel="both")
+    np.testing.assert_allclose(model.phase_exc, 0.31)
+    np.testing.assert_allclose(model.phase_det, 0.77)
+
+
+def test_fourpi_phase_scan_invalid_channel_raises():
+    model = FourPiConfocalMicroscope(wl_exc=488, pinhole_size=0.8, **BASE_KWARGS)
+    with pytest.raises(ValueError):
+        model.phase_scan(np.linspace(0, np.pi, 3), channel="invalid")
+
+
+def test_confocal_sheppard_aberration_coerces_and_runs():
+    model = ConfocalMicroscope(
+        model="sheppard",
+        na=1.1,
+        ni=1.33,
+        wl=520,
+        size=32,
+        pixel_size=80,
+        oversample_factor=1,
+        wl_exc=488,
+        pinhole_size=1.0,
+        aberrations_em={"defocus": 0.15},
+    )
+    assert model.PSF.shape[0] == 32
