@@ -268,14 +268,38 @@ class ConfocalMicroscope(WidefieldMicroscope):
         if self.pinhole_mode == "object":
             return fftconvolve(det_psf, kernel[None], "same", axes=(1, 2))
         if self.pinhole_mode == "detector":
-            kernel_pad = np.zeros(det_psf.shape[1:], dtype=float)
+            # Perform a linear (not circular) convolution in the detector plane by
+            # zero-padding both the PSF and the pinhole kernel to the full
+            # convolution size, multiplying in the OTF domain, and then cropping
+            # back to the original PSF size (equivalent to mode="same").
+            nz, ny, nx = det_psf.shape
             ky, kx = kernel.shape
-            y0 = (kernel_pad.shape[0] - ky) // 2
-            x0 = (kernel_pad.shape[1] - kx) // 2
-            kernel_pad[y0 : y0 + ky, x0 : x0 + kx] = kernel
+            out_y = ny + ky - 1
+            out_x = nx + kx - 1
+
+            # Pad and center the pinhole kernel in the larger array.
+            kernel_pad = np.zeros((out_y, out_x), dtype=float)
+            y0_k = (out_y - ky) // 2
+            x0_k = (out_x - kx) // 2
+            kernel_pad[y0_k : y0_k + ky, x0_k : x0_k + kx] = kernel
+
+            # Pad and center the detection PSF slices in the larger array.
+            psf_pad = np.zeros((nz, out_y, out_x), dtype=det_psf.dtype)
+            y0_p = (out_y - ny) // 2
+            x0_p = (out_x - nx) // 2
+            psf_pad[:, y0_p : y0_p + ny, x0_p : x0_p + nx] = det_psf
+
+            # FFT-based linear convolution: multiply OTFs and transform back.
             pinhole_otf = easy_fft(kernel_pad, axes=(0, 1))
-            det_otf = easy_fft(det_psf, axes=(1, 2))
-            return easy_ifft(det_otf * pinhole_otf[None], axes=(1, 2)).real
+            det_otf = easy_fft(psf_pad, axes=(1, 2))
+            filtered = easy_ifft(det_otf * pinhole_otf[None], axes=(1, 2)).real
+
+            # Crop back to the original PSF size (mode="same").
+            start_y = (out_y - ny) // 2
+            start_x = (out_x - nx) // 2
+            end_y = start_y + ny
+            end_x = start_x + nx
+            return filtered[:, start_y:end_y, start_x:end_x]
         raise ValueError("`pinhole_mode` must be one of {'object', 'detector'}")
 
     @property
