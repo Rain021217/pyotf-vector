@@ -34,6 +34,7 @@ The package is made up of four component modules:
 - `phase_retrieval.py` which contains functions and classes to perform iterative [phase retrieval][3] of the rear aperature of the optical system
 - `zernike.py` which contains functions for calculating [Zernike Polynomials](https://en.wikipedia.org/wiki/Zernike_polynomials)
 - `utils.py` which contains various utility functions used throughout the package.
+- `vector.py` which contains a direct Richards-Wolf/Debye vectorial reference solver and analysis helpers for validating FFT-based models.
 
 ### otf.py
 
