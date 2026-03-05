@@ -303,6 +303,7 @@ class ConfocalMicroscope(WidefieldMicroscope):
             + f", wl_exc={self.model_exc.wl}, pinhole_size={self.pinhole_size}, pinhole_mode='{self.pinhole_mode}')"
         )
 
+
     @property
     def excitation_psf(self):
         """Vector-aware excitation intensity PSF on the internal simulation grid."""
