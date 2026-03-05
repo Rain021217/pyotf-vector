@@ -18,14 +18,14 @@ Copyright (c) 2020, David Hoffman
 
 import copy
 import logging
-from functools import cached_property
+from functools import cached_property, lru_cache
 
 import numpy as np
 from dphtools.utils import bin_ndarray, radial_profile, slice_maker
 from scipy.signal import fftconvolve
 
 from .display import otf_plot, psf_plot
-from .otf import HanserPSF, SheppardPSF
+from .otf import HanserPSF, SheppardPSF, apply_aberration, apply_named_aberrations
 from .utils import NumericProperty, easy_fft, easy_ifft
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,8 @@ def _choose_model(model):
         return MODELS[model.lower()]
     except KeyError:
         raise ValueError(
-            f"Model {model:} doesn't exist please choose one of: " + ", ".join(MODELS.keys())
+            f"Model {model:} doesn't exist please choose one of: "
+            + ", ".join(MODELS.keys())
         )
 
 
@@ -55,7 +56,9 @@ class WidefieldMicroscope(object):
         doc="By how much do you want to oversample the simulation",
     )
 
-    def __init__(self, *, model, na, ni, wl, size, pixel_size, oversample_factor, **kwargs):
+    def __init__(
+        self, *, model, na, ni, wl, size, pixel_size, oversample_factor, **kwargs
+    ):
         # set zsize and zres here because we don't want to oversample there.
 
         self.oversample_factor = oversample_factor
@@ -119,7 +122,9 @@ class WidefieldMicroscope(object):
                 psf = np.roll(psf, (shift, shift), axis=(1, 2))
 
             # only bin in the lateral direction
-            psf = bin_ndarray(psf, bin_size=(1, self.oversample_factor, self.oversample_factor))
+            psf = bin_ndarray(
+                psf, bin_size=(1, self.oversample_factor, self.oversample_factor)
+            )
 
         # normalize psf
         return psf / psf.sum()
@@ -145,7 +150,9 @@ class WidefieldMicroscope(object):
 
         max_loc = np.unravel_index(self.PSF.argmax(), self.PSF.shape)
         crop = slice_maker(max_loc, (axial_extent, lateral_extent, lateral_extent))
-        return psf_plot(self.PSF[crop], zres=self.pixel_size, res=self.pixel_size, **kwargs)
+        return psf_plot(
+            self.PSF[crop], zres=self.pixel_size, res=self.pixel_size, **kwargs
+        )
 
     def plot_otf(self, **kwargs):
         """Plot the intensity OTF.
@@ -172,6 +179,7 @@ class WidefieldMicroscope(object):
         return fig, axs
 
 
+@lru_cache(maxsize=128)
 def _disk_kernel(radius):
     """Model of the pinhole transmission function."""
     full_size = int(np.ceil(radius * 2))
@@ -183,6 +191,51 @@ def _disk_kernel(radius):
     return kernel / kernel.sum()
 
 
+def _coerce_to_hanser_for_aberration(model):
+    """Coerce supported models to HanserPSF so aberration APIs are usable."""
+    if isinstance(model, HanserPSF):
+        return model
+    if isinstance(model, SheppardPSF):
+        logger.info(
+            "Aberrations for SheppardPSF are applied via an equivalent HanserPSF proxy"
+        )
+        return HanserPSF(
+            wl=model.wl,
+            na=model.na,
+            ni=model.ni,
+            res=model.res,
+            size=model.size,
+            zres=model.zres,
+            zsize=model.zsize,
+            vec_corr=model.vec_corr,
+            condition=model.condition,
+        )
+    raise ValueError(
+        "Aberration application is only supported for HanserPSF/SheppardPSF-backed microscopes"
+    )
+
+
+def _apply_aberration_spec(model, *, mcoefs=None, pcoefs=None, aberrations=None):
+    """Apply one of the supported aberration specifications to a PSF model."""
+    has_spec = aberrations is not None or mcoefs is not None or pcoefs is not None
+    if not has_spec:
+        return model
+
+    model = _coerce_to_hanser_for_aberration(model)
+    if aberrations is not None:
+        if not isinstance(aberrations, dict):
+            raise TypeError("`aberrations` must be a dict of named aberrations")
+        return apply_named_aberrations(model, aberrations)
+    return apply_aberration(model, mcoefs, pcoefs)
+
+
+def _validate_pinhole_mode(mode):
+    valid = {"object", "detector"}
+    if mode not in valid:
+        raise ValueError(f"`pinhole_mode` must be one of {valid}")
+    return mode
+
+
 class ConfocalMicroscope(WidefieldMicroscope):
     """A class representing a confocal microscope."""
 
@@ -192,39 +245,318 @@ class ConfocalMicroscope(WidefieldMicroscope):
         doc="Size of the pinhole (in airy units relative to emission wavelength",
     )
 
-    wl_exc = NumericProperty(attr="_wl_exc", vartype=float, doc="The excitation wavelength")
+    wl_exc = NumericProperty(
+        attr="_wl_exc", vartype=float, doc="The excitation wavelength"
+    )
 
-    def __init__(self, *, wl_exc, pinhole_size, **kwargs):
+    @property
+    def pinhole_mode(self):
+        """How to apply the pinhole model: in object space or detector Fourier domain."""
+        return self._pinhole_mode
+
+    @pinhole_mode.setter
+    def pinhole_mode(self, value):
+        self._pinhole_mode = _validate_pinhole_mode(value)
+        self._attribute_changed()
+
+    def __init__(
+        self,
+        *,
+        wl_exc,
+        pinhole_size,
+        pcoefs_em=None,
+        mcoefs_em=None,
+        pcoefs_exc=None,
+        mcoefs_exc=None,
+        aberrations_em=None,
+        aberrations_exc=None,
+        excitation_vec_corr="total",
+        pinhole_mode="object",
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         self.pinhole_size = pinhole_size
+        self.wl_exc = float(wl_exc)
+        self.pinhole_mode = pinhole_mode
 
-        # make the emission PSF
+        self.model = _apply_aberration_spec(
+            self.model, mcoefs=mcoefs_em, pcoefs=pcoefs_em, aberrations=aberrations_em
+        )
+
+        # make the excitation PSF
         self.model_exc = copy.deepcopy(self.model)
-        self.model_exc.wl = wl_exc
+        self.model_exc.wl = self.wl_exc
+        self.model_exc.vec_corr = excitation_vec_corr
+        self.model_exc = _apply_aberration_spec(
+            self.model_exc,
+            mcoefs=mcoefs_exc,
+            pcoefs=pcoefs_exc,
+            aberrations=aberrations_exc,
+        )
 
     def __repr__(self):
         """Represent a confocal microscope."""
         return (
             super().__repr__()[:-1]
-            + f", wl_exc={self.model_exc.wl}, pinhole_size={self.pinhole_size})"
+            + f", wl_exc={self.model_exc.wl}, pinhole_size={self.pinhole_size}, pinhole_mode='{self.pinhole_mode}')"
         )
+
+
+    @property
+    def excitation_psf(self):
+        """Vector-aware excitation intensity PSF on the internal simulation grid."""
+        return self.model_exc.PSFi
+
+    @property
+    def excitation_psf(self):
+        """Vector-aware excitation intensity PSF on the internal simulation grid."""
+        return self.model_exc.PSFi
+
+    @property
+    def detection_psf(self):
+        """Detection intensity PSF after pinhole transmission."""
+        return self._pinhole_filter_psf(self.model.PSFi)
+
+    def _pinhole_radius_px(self):
+        airy_unit = 1.22 * self.model.wl / self.model.na / self.model.res
+        logger.debug(f"Airy unit = {airy_unit:}")
+        return self.pinhole_size * airy_unit / 2
+
+    def _pinhole_filter_psf(self, det_psf):
+        pixel_pinhole_radius = self._pinhole_radius_px()
+        if pixel_pinhole_radius <= 1.5:
+            return det_psf
+
+        kernel = _disk_kernel(float(pixel_pinhole_radius))
+        if self.pinhole_mode == "object":
+            return fftconvolve(det_psf, kernel[None], "same", axes=(1, 2))
+        if self.pinhole_mode == "detector":
+            # Perform a linear (not circular) convolution in the detector plane by
+            # zero-padding both the PSF and the pinhole kernel to the full
+            # convolution size, multiplying in the OTF domain, and then cropping
+            # back to the original PSF size (equivalent to mode="same").
+            nz, ny, nx = det_psf.shape
+            ky, kx = kernel.shape
+            out_y = ny + ky - 1
+            out_x = nx + kx - 1
+
+            # Pad and center the pinhole kernel in the larger array.
+            kernel_pad = np.zeros((out_y, out_x), dtype=float)
+            y0_k = (out_y - ky) // 2
+            x0_k = (out_x - kx) // 2
+            kernel_pad[y0_k : y0_k + ky, x0_k : x0_k + kx] = kernel
+
+            # Pad and center the detection PSF slices in the larger array.
+            psf_pad = np.zeros((nz, out_y, out_x), dtype=det_psf.dtype)
+            y0_p = (out_y - ny) // 2
+            x0_p = (out_x - nx) // 2
+            psf_pad[:, y0_p : y0_p + ny, x0_p : x0_p + nx] = det_psf
+
+            # FFT-based linear convolution: multiply OTFs and transform back.
+            pinhole_otf = easy_fft(kernel_pad, axes=(0, 1))
+            det_otf = easy_fft(psf_pad, axes=(1, 2))
+            filtered = easy_ifft(det_otf * pinhole_otf[None], axes=(1, 2)).real
+
+            # Crop back to the original PSF size (mode="same").
+            start_y = (out_y - ny) // 2
+            start_x = (out_x - nx) // 2
+            end_y = start_y + ny
+            end_x = start_x + nx
+            return filtered[:, start_y:end_y, start_x:end_x]
+        raise ValueError("`pinhole_mode` must be one of {'object', 'detector'}")
+
+    @property
+    def excitation_psf(self):
+        """Vector-aware excitation intensity PSF on the internal simulation grid."""
+        return self.model_exc.PSFi
+
+    @property
+    def detection_psf(self):
+        """Detection intensity PSF after pinhole transmission."""
+        return self._pinhole_filter_psf(self.model.PSFi)
+
+    def _pinhole_radius_px(self):
+        airy_unit = 1.22 * self.model.wl / self.model.na / self.model.res
+        logger.debug(f"Airy unit = {airy_unit:}")
+        return self.pinhole_size * airy_unit / 2
+
+    def _pinhole_filter_psf(self, det_psf):
+        pixel_pinhole_radius = self._pinhole_radius_px()
+        if pixel_pinhole_radius <= 1.5:
+            return det_psf
+
+        kernel = _disk_kernel(float(pixel_pinhole_radius))
+        if self.pinhole_mode == "object":
+            return fftconvolve(det_psf, kernel[None], "same", axes=(1, 2))
+        if self.pinhole_mode == "detector":
+            kernel_pad = np.zeros(det_psf.shape[1:], dtype=float)
+            ky, kx = kernel.shape
+            y0 = (kernel_pad.shape[0] - ky) // 2
+            x0 = (kernel_pad.shape[1] - kx) // 2
+            kernel_pad[y0 : y0 + ky, x0 : x0 + kx] = kernel
+            pinhole_otf = easy_fft(kernel_pad, axes=(0, 1))
+            det_otf = easy_fft(det_psf, axes=(1, 2))
+            return easy_ifft(det_otf * pinhole_otf[None], axes=(1, 2)).real
+        raise RuntimeError("Invalid internal pinhole mode state")
+
+    @property
+    def excitation_psf(self):
+        """Vector-aware excitation intensity PSF on the internal simulation grid."""
+        return self.model_exc.PSFi
+
+    @property
+    def detection_psf(self):
+        """Detection intensity PSF after pinhole transmission."""
+        return self._pinhole_filter_psf(self.model.PSFi)
+
+    def _pinhole_radius_px(self):
+        airy_unit = 1.22 * self.model.wl / self.model.na / self.model.res
+        logger.debug(f"Airy unit = {airy_unit:}")
+        return self.pinhole_size * airy_unit / 2
+
+    def _pinhole_filter_psf(self, det_psf):
+        pixel_pinhole_radius = self._pinhole_radius_px()
+        if pixel_pinhole_radius <= 1.5:
+            return det_psf
+
+        kernel = _disk_kernel(float(pixel_pinhole_radius))
+        if self.pinhole_mode == "object":
+            return fftconvolve(det_psf, kernel[None], "same", axes=(1, 2))
+        if self.pinhole_mode == "detector":
+            kernel_pad = np.zeros(det_psf.shape[1:], dtype=float)
+            ky, kx = kernel.shape
+            y0 = (kernel_pad.shape[0] - ky) // 2
+            x0 = (kernel_pad.shape[1] - kx) // 2
+            kernel_pad[y0 : y0 + ky, x0 : x0 + kx] = kernel
+            pinhole_otf = easy_fft(kernel_pad, axes=(0, 1))
+            det_otf = easy_fft(det_psf, axes=(1, 2))
+            return easy_ifft(det_otf * pinhole_otf[None], axes=(1, 2)).real
+        raise RuntimeError("Invalid internal pinhole mode state")
 
     @property
     def model_psf(self):
         """Oversampled confocal PSF."""
-        # Calculate the AU in pixels
-        airy_unit = 1.22 * self.model.wl / self.model.na / self.model.res
-        logger.debug(f"Airy unit = {airy_unit:}")
-        # Calculate the pinhole radius in pixels
-        pixel_pinhole_radius = self.pinhole_size * airy_unit / 2
-        #
-        if pixel_pinhole_radius > 1.5:
-            kernel = _disk_kernel(pixel_pinhole_radius)
-            psf_det_au = fftconvolve(self.model.PSFi, kernel[None], "same", axes=(1, 2))
-        else:
-            psf_det_au = self.model.PSFi
-        psf_con_au = psf_det_au * self.model_exc.PSFi
-        return psf_con_au
+        psf_det_au = self.detection_psf
+        return psf_det_au * self.excitation_psf
+
+
+class FourPiConfocalMicroscope(ConfocalMicroscope):
+    """4Pi-confocal model with arm-specific phase/amplitude/aberration controls."""
+
+    def __init__(
+        self,
+        *,
+        phase_exc=0.0,
+        phase_det=0.0,
+        interfere_excitation=True,
+        interfere_detection=True,
+        amp_ratio_exc=1.0,
+        amp_ratio_det=1.0,
+        aberrations_exc_arm1=None,
+        aberrations_exc_arm2=None,
+        aberrations_det_arm1=None,
+        aberrations_det_arm2=None,
+        pcoefs_exc_arm1=None,
+        mcoefs_exc_arm1=None,
+        pcoefs_exc_arm2=None,
+        mcoefs_exc_arm2=None,
+        pcoefs_det_arm1=None,
+        mcoefs_det_arm1=None,
+        pcoefs_det_arm2=None,
+        mcoefs_det_arm2=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.phase_exc = phase_exc
+        self.phase_det = phase_det
+        self.interfere_excitation = interfere_excitation
+        self.interfere_detection = interfere_detection
+        self.amp_ratio_exc = float(amp_ratio_exc)
+        self.amp_ratio_det = float(amp_ratio_det)
+        if self.amp_ratio_exc <= 0 or self.amp_ratio_det <= 0:
+            raise ValueError("`amp_ratio_exc` and `amp_ratio_det` must be positive")
+
+        self.model_det_arm1 = _apply_aberration_spec(
+            copy.deepcopy(self.model),
+            mcoefs=mcoefs_det_arm1,
+            pcoefs=pcoefs_det_arm1,
+            aberrations=aberrations_det_arm1,
+        )
+        self.model_det_arm2 = _apply_aberration_spec(
+            copy.deepcopy(self.model),
+            mcoefs=mcoefs_det_arm2,
+            pcoefs=pcoefs_det_arm2,
+            aberrations=aberrations_det_arm2,
+        )
+
+        self.model_exc_arm1 = _apply_aberration_spec(
+            copy.deepcopy(self.model_exc),
+            mcoefs=mcoefs_exc_arm1,
+            pcoefs=pcoefs_exc_arm1,
+            aberrations=aberrations_exc_arm1,
+        )
+        self.model_exc_arm2 = _apply_aberration_spec(
+            copy.deepcopy(self.model_exc),
+            mcoefs=mcoefs_exc_arm2,
+            pcoefs=pcoefs_exc_arm2,
+            aberrations=aberrations_exc_arm2,
+        )
+
+    @staticmethod
+    def _intensity_from_arms(model_arm1, model_arm2, phase, amp_ratio, interfere=True):
+        field_arm1 = model_arm1.PSFa
+        field_arm2 = np.flip(model_arm2.PSFa, axis=1) * np.exp(1j * phase)
+        field_arm2 = np.sqrt(amp_ratio) * field_arm2
+        if interfere:
+            return (np.abs(field_arm1 + field_arm2) ** 2).sum(axis=0)
+        return (np.abs(field_arm1) ** 2).sum(axis=0) + (np.abs(field_arm2) ** 2).sum(
+            axis=0
+        )
+
+    @property
+    def excitation_psf(self):
+        return self._intensity_from_arms(
+            self.model_exc_arm1,
+            self.model_exc_arm2,
+            self.phase_exc,
+            self.amp_ratio_exc,
+            self.interfere_excitation,
+        )
+
+    @property
+    def detection_psf(self):
+        det_psf = self._intensity_from_arms(
+            self.model_det_arm1,
+            self.model_det_arm2,
+            self.phase_det,
+            self.amp_ratio_det,
+            self.interfere_detection,
+        )
+        return self._pinhole_filter_psf(det_psf)
+
+    def phase_scan(self, phases, channel="both"):
+        """Generate phase-scan stacks for 4Pi modes (e.g. I5M/I5S style post-processing)."""
+        valid_channels = {"both", "excitation", "detection"}
+        if channel not in valid_channels:
+            raise ValueError(f"`channel` must be one of {valid_channels}")
+
+        phases = np.asarray(phases, dtype=float)
+        out = []
+        phase_exc0, phase_det0 = self.phase_exc, self.phase_det
+        try:
+            for phase in phases:
+                if channel in {"both", "excitation"}:
+                    self.phase_exc = phase
+                if channel in {"both", "detection"}:
+                    self.phase_det = phase
+                out.append(self.model_psf)
+        finally:
+            self.phase_exc, self.phase_det = phase_exc0, phase_det0
+        return np.asarray(out)
+
+    @property
+    def model_psf(self):
+        return self.detection_psf * self.excitation_psf
 
 
 class ApotomeMicroscope(WidefieldMicroscope):
@@ -252,7 +584,9 @@ class ApotomeMicroscope(WidefieldMicroscope):
         # define the Abbe diffraction limit in frequency space pixels.
         nyquist_sampling = self.psf_params["wl"] / self.psf_params["na"] / 4
         abbe_limit = int(
-            np.rint(self.psf_params["size"] * self.psf_params["res"] / nyquist_sampling / 2)
+            np.rint(
+                self.psf_params["size"] * self.psf_params["res"] / nyquist_sampling / 2
+            )
         )
 
         # define the approximate axial response of the system
@@ -266,7 +600,9 @@ class BaseSIMMicroscope(WidefieldMicroscope):
     """A base class for SIM and SIM like microscopes."""
 
     na_exc = NumericProperty(attr="_na_exc", vartype=float, doc="The excitation NA")
-    wl_exc = NumericProperty(attr="_wl_exc", vartype=float, doc="The excitation wavelength")
+    wl_exc = NumericProperty(
+        attr="_wl_exc", vartype=float, doc="The excitation wavelength"
+    )
     coherent = NumericProperty(
         attr="_coherent", vartype=bool, doc="Treat the orientations coherently?"
     )
@@ -276,7 +612,16 @@ class BaseSIMMicroscope(WidefieldMicroscope):
     )
 
     def __init__(
-        self, *, na_exc, wl_exc, wiener, coherent, dc, dc_suppress, orientations, **kwargs
+        self,
+        *,
+        na_exc,
+        wl_exc,
+        wiener,
+        coherent,
+        dc,
+        dc_suppress,
+        orientations,
+        **kwargs,
     ):  # noqa: D205,D208,D400,D403
         """orientations : sequence
             The different orentation angles of the excitation
@@ -291,7 +636,7 @@ class BaseSIMMicroscope(WidefieldMicroscope):
 
         if wl_exc is None:
             wl_exc = self.psf_params["wl"]
-        self.wl_exc = wl_exc
+        self.wl_exc = float(wl_exc)
 
         self.coherent = coherent
         self.dc = dc
@@ -301,7 +646,9 @@ class BaseSIMMicroscope(WidefieldMicroscope):
 
         self.wiener = wiener
         if self.wiener < 0:
-            raise ValueError(f"self.wiener is {self.wiener:} which should be greater than zero")
+            raise ValueError(
+                f"self.wiener is {self.wiener:} which should be greater than zero"
+            )
 
     def __repr__(self):
         """Represent a SIM microscope."""
@@ -355,11 +702,15 @@ class BaseSIMMicroscope(WidefieldMicroscope):
             # wiener deconvolution doesn't prescribe it
             psf = easy_ifft(wiener_otf).real
         else:
-            raise ValueError(f"self.wiener is {self.wiener:} which should be greater than zero")
+            raise ValueError(
+                f"self.wiener is {self.wiener:} which should be greater than zero"
+            )
 
         # Are we including a DC beam?
         if self.dc:
-            base_pattern = np.exp(1j * zz * freq) * np.ones(psf.shape[1:], dtype=complex)[None]
+            base_pattern = (
+                np.exp(1j * zz * freq) * np.ones(psf.shape[1:], dtype=complex)[None]
+            )
         else:
             base_pattern = np.zeros(psf.shape, dtype=complex)
 
@@ -384,7 +735,9 @@ class BaseSIMMicroscope(WidefieldMicroscope):
 
             # build up the excitation pattern
             for theta in (-alpha, alpha):
-                exc_pattern += np.exp(1j * ((rr * np.sin(theta) + zz * np.cos(theta)) * freq))
+                exc_pattern += np.exp(
+                    1j * ((rr * np.sin(theta) + zz * np.cos(theta)) * freq)
+                )
 
             # if we're not coherent sum the effective PSFs for each orientation
             if not self.coherent:
@@ -441,7 +794,12 @@ if __name__ == "__main__":
         "vec_corr": "none",
     }
 
-    sim_psf_params = {"na_exc": None, "wl_exc": 0.561, "wiener": 0.1, "dc_suppress": True}
+    sim_psf_params = {
+        "na_exc": None,
+        "wl_exc": 0.561,
+        "wiener": 0.1,
+        "dc_suppress": True,
+    }
 
     sim_psf_params.update(base_psf_params)
 
@@ -452,14 +810,23 @@ if __name__ == "__main__":
         ConfocalMicroscope(**base_psf_params, pinhole_size=1.5, wl_exc=0.561),
         ConfocalMicroscope(**base_psf_params, pinhole_size=0, wl_exc=0.561),
         SIM2DMicroscope(
-            orientations=orientations, **{**sim_psf_params, "na_exc": sim_psf_params["na"] / 2}
+            orientations=orientations,
+            **{**sim_psf_params, "na_exc": sim_psf_params["na"] / 2},
         ),
         SIM2DMicroscope(orientations=orientations, **sim_psf_params),
         SIM3DMicroscope(orientations=orientations, **sim_psf_params),
         LatticeSIMMicroscope(**sim_psf_params),
     )
 
-    labels = ("Epi", "Confocal 1.5 AU", "AiryScan", "OS-SIM", "2D-SIM", "3D-SIM", "Lattice SIM")
+    labels = (
+        "Epi",
+        "Confocal 1.5 AU",
+        "AiryScan",
+        "OS-SIM",
+        "2D-SIM",
+        "3D-SIM",
+        "Lattice SIM",
+    )
 
     ncols = len(psfs)
     gam = 0.5
@@ -516,11 +883,15 @@ if __name__ == "__main__":
         otf = np.fmax(otf, vmin)
         c = (len(otf) + 1) // 2
 
-        col[2].matshow(otf[:, c], norm=mpl.colors.LogNorm(), interpolation=interpolation)
+        col[2].matshow(
+            otf[:, c], norm=mpl.colors.LogNorm(), interpolation=interpolation
+        )
         col[3].matshow(otf[c], norm=mpl.colors.LogNorm(), interpolation=interpolation)
 
         pp = p.sum((1, 2))
-        axp.plot((np.arange(len(pp)) - (len(pp) + 1) // 2) * res, pp / pp.max(), label=l)
+        axp.plot(
+            (np.arange(len(pp)) - (len(pp) + 1) // 2) * res, pp / pp.max(), label=l
+        )
 
     for ax in grid:
         ax.xaxis.set_major_locator(plt.NullLocator())
