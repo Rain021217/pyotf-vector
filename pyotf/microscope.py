@@ -279,12 +279,14 @@ class ConfocalMicroscope(WidefieldMicroscope):
         self.wl_exc = float(wl_exc)
         self.pinhole_mode = pinhole_mode
 
+        # Build excitation model from the pre-aberration baseline so excitation and
+        # detection aberrations remain independent.
+        base_model = copy.deepcopy(self.model)
         self.model = _apply_aberration_spec(
             self.model, mcoefs=mcoefs_em, pcoefs=pcoefs_em, aberrations=aberrations_em
         )
 
-        # make the excitation PSF
-        self.model_exc = copy.deepcopy(self.model)
+        self.model_exc = base_model
         self.model_exc.wl = self.wl_exc
         self.model_exc.vec_corr = excitation_vec_corr
         self.model_exc = _apply_aberration_spec(
@@ -308,11 +310,6 @@ class ConfocalMicroscope(WidefieldMicroscope):
         return self.model_exc.PSFi
 
     @property
-    def excitation_psf(self):
-        """Vector-aware excitation intensity PSF on the internal simulation grid."""
-        return self.model_exc.PSFi
-
-    @property
     def detection_psf(self):
         """Detection intensity PSF after pinhole transmission."""
         return self._pinhole_filter_psf(self.model.PSFi)
@@ -331,83 +328,81 @@ class ConfocalMicroscope(WidefieldMicroscope):
         if self.pinhole_mode == "object":
             return fftconvolve(det_psf, kernel[None], "same", axes=(1, 2))
         if self.pinhole_mode == "detector":
-            # Perform a linear (not circular) convolution in the detector plane by
-            # zero-padding both the PSF and the pinhole kernel to the full
-            # convolution size, multiplying in the OTF domain, and then cropping
-            # back to the original PSF size (equivalent to mode="same").
+            # Linear (non-wrapping) convolution in detector plane via zero-padding.
             nz, ny, nx = det_psf.shape
             ky, kx = kernel.shape
             out_y = ny + ky - 1
             out_x = nx + kx - 1
 
-            # Pad and center the pinhole kernel in the larger array.
             kernel_pad = np.zeros((out_y, out_x), dtype=float)
             y0_k = (out_y - ky) // 2
             x0_k = (out_x - kx) // 2
             kernel_pad[y0_k : y0_k + ky, x0_k : x0_k + kx] = kernel
 
-            # Pad and center the detection PSF slices in the larger array.
             psf_pad = np.zeros((nz, out_y, out_x), dtype=det_psf.dtype)
             y0_p = (out_y - ny) // 2
             x0_p = (out_x - nx) // 2
             psf_pad[:, y0_p : y0_p + ny, x0_p : x0_p + nx] = det_psf
 
-            # FFT-based linear convolution: multiply OTFs and transform back.
             pinhole_otf = easy_fft(kernel_pad, axes=(0, 1))
             det_otf = easy_fft(psf_pad, axes=(1, 2))
             filtered = easy_ifft(det_otf * pinhole_otf[None], axes=(1, 2)).real
 
-            # Crop back to the original PSF size (mode="same").
             start_y = (out_y - ny) // 2
             start_x = (out_x - nx) // 2
-            end_y = start_y + ny
-            end_x = start_x + nx
-            return filtered[:, start_y:end_y, start_x:end_x]
-        raise ValueError("`pinhole_mode` must be one of {'object', 'detector'}")
-
-    @property
-    def excitation_psf(self):
-        """Vector-aware excitation intensity PSF on the internal simulation grid."""
-        return self.model_exc.PSFi
-
-    @property
-    def detection_psf(self):
-        """Detection intensity PSF after pinhole transmission."""
-        return self._pinhole_filter_psf(self.model.PSFi)
-
-    def _pinhole_radius_px(self):
-        airy_unit = 1.22 * self.model.wl / self.model.na / self.model.res
-        logger.debug(f"Airy unit = {airy_unit:}")
-        return self.pinhole_size * airy_unit / 2
-
-    def _pinhole_filter_psf(self, det_psf):
-        pixel_pinhole_radius = self._pinhole_radius_px()
-        if pixel_pinhole_radius <= 1.5:
-            return det_psf
-
-        kernel = _disk_kernel(float(pixel_pinhole_radius))
-        if self.pinhole_mode == "object":
-            return fftconvolve(det_psf, kernel[None], "same", axes=(1, 2))
-        if self.pinhole_mode == "detector":
-            kernel_pad = np.zeros(det_psf.shape[1:], dtype=float)
-            ky, kx = kernel.shape
-            y0 = (kernel_pad.shape[0] - ky) // 2
-            x0 = (kernel_pad.shape[1] - kx) // 2
-            kernel_pad[y0 : y0 + ky, x0 : x0 + kx] = kernel
-            pinhole_otf = easy_fft(kernel_pad, axes=(0, 1))
-            det_otf = easy_fft(det_psf, axes=(1, 2))
-            return easy_ifft(det_otf * pinhole_otf[None], axes=(1, 2)).real
+            return filtered[:, start_y : start_y + ny, start_x : start_x + nx]
         raise RuntimeError("Invalid internal pinhole mode state")
 
     @property
     def model_psf(self):
         """Oversampled confocal PSF."""
-        psf_det_au = self.detection_psf
-        return psf_det_au * self.excitation_psf
+        return self.detection_psf * self.excitation_psf
 
 
 class FourPiConfocalMicroscope(ConfocalMicroscope):
     """4Pi-confocal model with arm-specific phase/amplitude/aberration controls."""
+
+    @property
+    def phase_exc(self):
+        return self._phase_exc
+
+    @phase_exc.setter
+    def phase_exc(self, value):
+        self._phase_exc = float(value)
+        self._attribute_changed()
+
+    @property
+    def phase_det(self):
+        return self._phase_det
+
+    @phase_det.setter
+    def phase_det(self, value):
+        self._phase_det = float(value)
+        self._attribute_changed()
+
+    @property
+    def amp_ratio_exc(self):
+        return self._amp_ratio_exc
+
+    @amp_ratio_exc.setter
+    def amp_ratio_exc(self, value):
+        value = float(value)
+        if value <= 0:
+            raise ValueError("`amp_ratio_exc` must be positive")
+        self._amp_ratio_exc = value
+        self._attribute_changed()
+
+    @property
+    def amp_ratio_det(self):
+        return self._amp_ratio_det
+
+    @amp_ratio_det.setter
+    def amp_ratio_det(self, value):
+        value = float(value)
+        if value <= 0:
+            raise ValueError("`amp_ratio_det` must be positive")
+        self._amp_ratio_det = value
+        self._attribute_changed()
 
     def __init__(
         self,
@@ -433,14 +428,12 @@ class FourPiConfocalMicroscope(ConfocalMicroscope):
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.phase_exc = phase_exc
-        self.phase_det = phase_det
         self.interfere_excitation = interfere_excitation
         self.interfere_detection = interfere_detection
-        self.amp_ratio_exc = float(amp_ratio_exc)
-        self.amp_ratio_det = float(amp_ratio_det)
-        if self.amp_ratio_exc <= 0 or self.amp_ratio_det <= 0:
-            raise ValueError("`amp_ratio_exc` and `amp_ratio_det` must be positive")
+        self.phase_exc = phase_exc
+        self.phase_det = phase_det
+        self.amp_ratio_exc = amp_ratio_exc
+        self.amp_ratio_det = amp_ratio_det
 
         self.model_det_arm1 = _apply_aberration_spec(
             copy.deepcopy(self.model),

@@ -139,3 +139,20 @@ def test_confocal_sheppard_aberration_coerces_and_runs():
         aberrations_em={"defocus": 0.15},
     )
     assert model.PSF.shape[0] == 32
+
+
+def test_confocal_emission_aberration_does_not_leak_to_excitation():
+    conf_no_ab = ConfocalMicroscope(wl_exc=488, pinhole_size=1.0, **BASE_KWARGS)
+    conf_em_ab = ConfocalMicroscope(
+        wl_exc=488, pinhole_size=1.0, aberrations_em={"defocus": 0.2}, **BASE_KWARGS
+    )
+    # excitation should be unchanged when only emission aberration is supplied
+    np.testing.assert_allclose(conf_no_ab.excitation_psf, conf_em_ab.excitation_psf)
+
+
+def test_fourpi_phase_change_invalidates_cached_psf():
+    model = FourPiConfocalMicroscope(wl_exc=488, pinhole_size=0.8, **BASE_KWARGS)
+    psf0 = model.PSF.copy()
+    model.phase_exc = model.phase_exc + np.pi / 3
+    psf1 = model.PSF
+    assert not np.allclose(psf0, psf1)
